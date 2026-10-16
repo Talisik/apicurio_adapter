@@ -4,16 +4,29 @@ Run with: uv run python -m unittest discover -s tests
 Every test fakes the registry; none needs a network.
 """
 
+import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import httpx
-from pydantic import ValidationError
+from pydantic import ConfigDict, Field, ValidationError
 
 from apicurio_adapter import RegistryEnum, RegistryError, RegistryModel, client, model
 
 client.configure(default_group="test.group")
+
+
+def reset():
+    """Versions are cached and the registry can be marked unreachable: start each test clean."""
+    client._version.cache_clear()
+    client.SOURCES.clear()
+    client._references.clear()
+    client._registry_down = False
+    client._warned = False
+    client._snapshot_dir = None
 
 
 PERSON = {
@@ -51,7 +64,7 @@ def reference(artifact, version):
 
 class ReferenceTest(unittest.TestCase):
     def setUp(self):
-        client._version.cache_clear()
+        reset()
 
     def fetch(self, versions, artifact="Parent", version=1):
         with mock.patch.object(client, "_get", fake_registry(versions)):
@@ -119,7 +132,7 @@ class ReferenceTest(unittest.TestCase):
 
 class RegistryModelTest(unittest.TestCase):
     def setUp(self):
-        client._version.cache_clear()  # versions are cached; each test fakes its own registry
+        reset()
 
     def test_builds_the_model_from_the_registry_and_keeps_behaviour(self):
         with mock.patch.object(model, "fetch_schema", return_value=PERSON) as fetch:
@@ -179,7 +192,10 @@ class RegistryModelTest(unittest.TestCase):
             class Person(RegistryModel, artifact="Person", version=2):
                 pass
 
-        self.assertEqual(get.call_count, 2 * client.ATTEMPTS)  # content and references
+        # content and references are asked for in parallel; once one has given up, the other
+        # may skip its retries
+        self.assertGreaterEqual(get.call_count, client.ATTEMPTS)
+        self.assertLessEqual(get.call_count, 2 * client.ATTEMPTS)
 
     def test_a_brief_network_failure_is_retried(self):
         failed = set()
@@ -249,6 +265,17 @@ class RegistryModelTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Person(name="ada")
         self.assertNotIn("extra", Person(name="ada", age=1, extra=1).model_dump())
+
+    def test_a_class_can_populate_a_field_by_its_name(self):
+        with mock.patch.object(model, "fetch_schema", return_value=PERSON):
+
+            class Person(RegistryModel, artifact="Person", version=2):
+                model_config = ConfigDict(populate_by_name=True)
+
+                key: int = Field(alias="_key")
+
+        self.assertEqual(Person(name="ada", age=1, key=7).key, 7)
+        self.assertEqual(Person(name="ada", age=1, _key=8).key, 8)
 
     def test_computed_fields_are_left_to_the_class(self):
         schema = {
@@ -326,8 +353,185 @@ class RegistryModelTest(unittest.TestCase):
         self.assertEqual(Kind.MISSING_FIELD.shout, "MISSING FIELD")
 
 
+class SnapshotTest(unittest.TestCase):
+    """The registry is asked first; a copy in the application's repo covers for it."""
+
+    def setUp(self):
+        reset()
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = Path(self.dir.name)
+        client.configure(snapshot_dir=self.path)
+
+    def tearDown(self):
+        reset()
+
+    def snapshot_file(self, artifact="Person", version=2, group="test.group"):
+        return self.path / group / f"{artifact}@{version}.json"
+
+    def registry(self, versions):
+        return mock.patch.object(client, "_get", fake_registry(versions))
+
+    def down(self):
+        return (
+            mock.patch.object(client.time, "sleep"),
+            mock.patch.object(httpx, "get", side_effect=httpx.ConnectError("down")),
+        )
+
+    def build(self, version=2):
+        class Person(RegistryModel, artifact="Person", version=version):
+            pass
+
+        return Person
+
+    def test_a_version_the_registry_supplies_is_saved(self):
+        with self.registry({("Person", 2): (PERSON, [])}):
+            self.build()
+
+        saved = json.loads(self.snapshot_file().read_text())
+
+        self.assertEqual(saved["content"], PERSON)
+        self.assertEqual(saved["references"], [])
+        self.assertEqual(model.LOADED[-1].source, "registry")
+
+    def test_the_snapshot_covers_for_an_unreachable_registry(self):
+        with self.registry({("Person", 2): (PERSON, [])}):
+            self.build()
+
+        reset()
+        client.configure(snapshot_dir=self.path)
+
+        sleep, get = self.down()
+        with sleep, get, self.assertLogs("apicurio_adapter", "WARNING") as logs:
+            person = self.build()
+
+        self.assertIn("age", person.model_fields)
+        self.assertEqual(model.LOADED[-1].source, "snapshot")
+        self.assertIn("using the snapshot of test.group/Person@2", logs.output[0])
+
+    def test_the_registry_wins_when_it_answers(self):
+        stale = {**PERSON, "properties": {"name": {"type": "string"}}, "required": []}
+        self.snapshot_file().parent.mkdir(parents=True)
+        self.snapshot_file().write_text(
+            json.dumps({"content": stale, "references": []})
+        )
+
+        with self.registry({("Person", 2): (PERSON, [])}):
+            person = self.build()
+
+        self.assertIn("age", person.model_fields)
+        self.assertEqual(model.LOADED[-1].source, "registry")
+
+    def test_an_existing_snapshot_is_not_rewritten(self):
+        self.snapshot_file().parent.mkdir(parents=True)
+        original = json.dumps({"content": {"marker": 1}, "references": []})
+        self.snapshot_file().write_text(original)
+
+        with self.registry({("Person", 2): (PERSON, [])}):
+            self.build()
+
+        self.assertEqual(self.snapshot_file().read_text(), original)
+
+    def test_an_error_answer_falls_back_too(self):
+        with self.registry({("Person", 2): (PERSON, [])}):
+            self.build()
+
+        for answer in (
+            httpx.Response(500, text="boom"),
+            httpx.Response(401, text="no"),
+            httpx.Response(404, text="gone"),
+            httpx.Response(200, text="<html>proxy error</html>"),
+        ):
+            with self.subTest(status=answer.status_code):
+                reset()
+                client.configure(snapshot_dir=self.path)
+
+                with (
+                    mock.patch.object(httpx, "get", return_value=answer),
+                    self.assertLogs("apicurio_adapter", "WARNING"),
+                ):
+                    self.build()
+
+                self.assertEqual(model.LOADED[-1].source, "snapshot")
+
+    def test_without_a_snapshot_the_error_names_where_it_looked(self):
+        sleep, get = self.down()
+
+        with sleep, get, self.assertRaisesRegex(RegistryError, "no snapshot of"):
+            self.build()
+
+    def test_without_a_snapshot_folder_the_original_error_stands(self):
+        client._snapshot_dir = None
+        sleep, get = self.down()
+
+        with sleep, get, self.assertRaisesRegex(RegistryError, "no snapshot folder"):
+            self.build()
+
+    def test_after_one_unreachable_answer_the_rest_skip_the_retries(self):
+        for version in (1, 2):
+            with self.registry({("Person", version): (PERSON, [])}):
+                self.build(version)
+
+        reset()
+        client.configure(snapshot_dir=self.path)
+
+        sleep, get = self.down()
+        with sleep, get as calls, self.assertLogs("apicurio_adapter", "WARNING"):
+            self.build(1)
+            first = calls.call_count
+            self.build(2)
+
+        self.assertLessEqual(first, 2 * client.ATTEMPTS)
+        self.assertEqual(calls.call_count, first)  # the second class never asked
+
+    def test_references_come_from_snapshots_too(self):
+        versions = {
+            ("Parent", 1): (
+                {"title": "Parent", "properties": {"c": {"$ref": "g.Child.json"}}},
+                [reference("Child", 1)],
+            ),
+            ("Child", 1): ({"title": "Child", "type": "object"}, []),
+        }
+
+        with self.registry(versions):
+            client.fetch_schema("Parent", 1, "g")
+
+        reset()
+        client.configure(snapshot_dir=self.path)
+
+        sleep, get = self.down()
+        with sleep, get, self.assertLogs("apicurio_adapter", "WARNING"):
+            schema = client.fetch_schema("Parent", 1, "g")
+
+        self.assertEqual(schema["properties"]["c"], {"$ref": "#/definitions/Child"})
+        self.assertEqual(client.source_of("g", "Parent", 1), "snapshot")
+
+    def test_a_folder_that_cannot_be_written_does_not_stop_the_registry_copy(self):
+        with (
+            self.registry({("Person", 2): (PERSON, [])}),
+            mock.patch.object(Path, "mkdir", side_effect=PermissionError("read-only")),
+        ):
+            person = self.build()
+
+        self.assertIn("age", person.model_fields)
+        self.assertFalse(self.snapshot_file().exists())
+
+    def test_the_environment_can_name_the_folder(self):
+        other = self.path / "elsewhere"
+
+        with (
+            mock.patch.dict(os.environ, {"REGISTRY_SNAPSHOT_DIR": str(other)}),
+            self.registry({("Person", 2): (PERSON, [])}),
+        ):
+            self.build()
+
+        self.assertTrue((other / "test.group" / "Person@2.json").is_file())
+        self.assertFalse(self.snapshot_file().exists())
+
+
 class ConfigurationTest(unittest.TestCase):
     def setUp(self):
+        reset()
         self.saved = (client._default_group, client._load_env)
 
     def tearDown(self):

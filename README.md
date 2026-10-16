@@ -41,6 +41,14 @@ class Platform(str, RegistryEnum, artifact="Platform", version=1):
   needs two different versions of one artifact, are errors.
 - A connection or name-lookup failure is retried 5 times; an HTTP error answer is not. Fetched
   versions are cached for the life of the process.
+- **Snapshots.** Point the adapter at a folder in your repo (`configure(snapshot_dir=...)` or
+  `REGISTRY_SNAPSHOT_DIR`). The registry is always asked first, and every version it supplies is
+  saved there as `<group>/<Artifact>@<version>.json` when the file is missing (a version never
+  changes, so a saved file is never rewritten). Commit the folder. When the registry cannot answer
+  (unreachable, timed out, an error status or unreadable reply), the saved copy is used instead and a
+  warning is logged. Once the registry has stayed unreachable through the retries, the rest of the
+  process skips straight to the snapshots. With no snapshot for a version the import fails, as before.
+  `LOADED[i].source` says `"registry"` or `"snapshot"` for each class.
 
 ## Configuration
 
@@ -50,6 +58,7 @@ class Platform(str, RegistryEnum, artifact="Platform", version=1):
 | `REGISTRY_GROUP`         | group of a class that does not pass `group=`             |
 | `REGISTRY_CLIENT_ID`     | HTTP Basic user, if the registry needs one               |
 | `REGISTRY_CLIENT_SECRET` | HTTP Basic password                                      |
+| `REGISTRY_SNAPSHOT_DIR`  | snapshot folder; overrides `configure(snapshot_dir=...)` |
 
 Call `configure` once, before the models are imported, for what the environment should not decide:
 

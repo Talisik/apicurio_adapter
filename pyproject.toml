@@ -1,6 +1,6 @@
 [project]
 name = "apicurio-adapter"
-version = "0.1.0"
+version = "1.1.0"
 description = "Pydantic models and enums built from Apicurio Registry schemas."
 readme = "README.md"
 authors = [{ name = "Mister Nyan", email = "michael.edmund.wong@gmail.com" }]

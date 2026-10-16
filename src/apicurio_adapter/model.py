@@ -45,7 +45,7 @@ from json_schema_to_pydantic import create_model
 from pydantic import BaseModel
 from pydantic._internal._model_construction import ModelMetaclass
 
-from .client import RegistryError, default_group, fetch_schema
+from .client import RegistryError, default_group, fetch_schema, source_of
 
 
 @dataclass(frozen=True)
@@ -55,6 +55,7 @@ class LoadedModel:
     group: str
     version: int
     fields: int
+    source: str = "registry"  # "snapshot" when the registry could not supply it
 
 
 #: Every RegistryModel / RegistryEnum built so far in this process, in the order built.
@@ -162,6 +163,11 @@ class _RegistryMeta(ModelMetaclass):
                 allow_undefined_type=True,
                 allow_undefined_array_items=True,
             )
+            # The library pins these to their defaults; left in place they would override
+            # a class's own `populate_by_name=True` (the base's explicit False wins).
+            for key in ("populate_by_name", "validate_by_name", "validate_by_alias"):
+                built.model_config.pop(key, None)
+
             given = dict(refs or {})
 
             if given:
@@ -176,7 +182,14 @@ class _RegistryMeta(ModelMetaclass):
 
         if artifact is not None:
             LOADED.append(
-                LoadedModel(name, artifact, group, version, len(model.model_fields))
+                LoadedModel(
+                    name,
+                    artifact,
+                    group,
+                    version,
+                    len(model.model_fields),
+                    source_of(group, artifact, version),
+                )
             )
 
         return model
@@ -226,7 +239,16 @@ class _RegistryEnumMeta(enum.EnumMeta):
         cls = super().__new__(mcls, name, bases, classdict, **kwargs)
 
         if artifact is not None:
-            LOADED.append(LoadedModel(name, artifact, group, version, len(cls)))
+            LOADED.append(
+                LoadedModel(
+                    name,
+                    artifact,
+                    group,
+                    version,
+                    len(cls),
+                    source_of(group, artifact, version),
+                )
+            )
 
         return cls
 

@@ -1,14 +1,20 @@
 """Reading schemas from an Apicurio Registry (v3 API) and resolving their references."""
 
 import copy
+import json
+import logging
 import os
+import tempfile
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import cache
+from pathlib import Path
 from typing import Any
 
 import httpx
+
+log = logging.getLogger("apicurio_adapter")
 
 API = "/apis/registry/v3"
 FETCH_TIMEOUT = 5
@@ -22,11 +28,22 @@ class RegistryError(RuntimeError):
 
 _default_group: str | None = None
 _load_env: Callable[[], None] | None = None
+_snapshot_dir: Path | None = None
+
+#: Where each registry version was read from in this process: "registry" or "snapshot".
+SOURCES: dict[tuple[str, str, int], str] = {}
+_references: dict[tuple[str, str, int], list] = {}
+_warned = False  # the first fallback is logged as a warning, the rest quietly
+
+#: Set when the registry stayed unreachable through every retry: the rest of this process goes
+#: straight to the snapshots instead of waiting out the retries again for every version.
+_registry_down = False
 
 
 def configure(
     default_group: str | None = None,
     load_env: Callable[[], None] | None = None,
+    snapshot_dir: str | Path | None = None,
 ) -> None:
     """
     Settings an application makes once, before it imports its models.
@@ -34,14 +51,21 @@ def configure(
     default_group  group of a class that does not pass `group=` (REGISTRY_GROUP overrides it)
     load_env       called before every read of the environment, for an application that loads
                    its .env lazily (models are fetched at import, which can be earlier)
+    snapshot_dir   folder in the application's repo holding a copy of every schema version it
+                   loads (REGISTRY_SNAPSHOT_DIR overrides it). The registry is always tried
+                   first; a version it cannot supply is read from here instead. Every version
+                   fetched from the registry is saved here when its file is missing.
     """
-    global _default_group, _load_env
+    global _default_group, _load_env, _snapshot_dir
 
     if default_group is not None:
         _default_group = default_group
 
     if load_env is not None:
         _load_env = load_env
+
+    if snapshot_dir is not None:
+        _snapshot_dir = Path(snapshot_dir)
 
 
 def _env(name: str) -> str | None:
@@ -67,7 +91,77 @@ def default_group() -> str:
     return group
 
 
+def snapshot_dir() -> Path | None:
+    configured = _env("REGISTRY_SNAPSHOT_DIR")
+
+    return Path(configured) if configured else _snapshot_dir
+
+
+def snapshot_path(group: str, artifact: str, version: int) -> Path | None:
+    directory = snapshot_dir()
+
+    return directory / group / f"{artifact}@{version}.json" if directory else None
+
+
+def _read_snapshot(group: str, artifact: str, version: int) -> tuple | None:
+    path = snapshot_path(group, artifact, version)
+
+    if path is None or not path.is_file():
+        return None
+
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+
+        return saved["content"], saved["references"]
+    except (OSError, ValueError, KeyError) as e:
+        log.warning("Ignoring the unreadable snapshot %s: %s", path, e)
+
+        return None
+
+
+def _write_snapshot(
+    group: str, artifact: str, version: int, content: Any, references: Any
+) -> None:
+    """Save a version the registry supplied. A version never changes, so an existing file is kept."""
+    path = snapshot_path(group, artifact, version)
+
+    if path is None or path.exists():
+        return
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(
+            "w", dir=path.parent, suffix=".tmp", delete=False, encoding="utf-8"
+        ) as tmp:
+            json.dump(
+                {
+                    "group": group,
+                    "artifact": artifact,
+                    "version": version,
+                    "content": content,
+                    "references": references,
+                },
+                tmp,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            tmp.write("\n")
+
+        os.replace(tmp.name, path)
+    except (
+        OSError
+    ) as e:  # a read-only image, for one: the registry copy is still in use
+        log.debug("Could not save the snapshot %s: %s", path, e)
+
+
 def _get(group: str, path: str, what: str) -> httpx.Response:
+    global _registry_down
+
+    if _registry_down:
+        raise RegistryError(f"The schema registry was unreachable earlier ({what})")
+
     client_id = _env("REGISTRY_CLIENT_ID")
     client_secret = _env("REGISTRY_CLIENT_SECRET")
     url = f"{registry_url()}{API}/groups/{group}/artifacts/{path}"
@@ -84,6 +178,8 @@ def _get(group: str, path: str, what: str) -> httpx.Response:
             break
         except httpx.TransportError as e:
             if attempt == ATTEMPTS:
+                _registry_down = True
+
                 raise RegistryError(
                     f"Cannot reach the schema registry for {what}: {e}"
                 ) from e
@@ -97,6 +193,13 @@ def _get(group: str, path: str, what: str) -> httpx.Response:
         )
 
     return res
+
+
+def _json(res: httpx.Response, what: str) -> Any:
+    try:
+        return res.json()
+    except ValueError as e:  # a proxy's error page with status 200, for one
+        raise RegistryError(f"Registry sent invalid JSON for {what}: {e}") from e
 
 
 def _rewrite_refs(node: Any, targets: dict[str, str]) -> Any:
@@ -117,17 +220,72 @@ def _rewrite_refs(node: Any, targets: dict[str, str]) -> Any:
 
 @cache
 def _version(group: str, artifact: str, version: int) -> tuple:
-    """The content and the references of one registry version. A version never changes, so this is cached."""
+    """
+    The content and the references of one version. A version never changes, so this is cached.
+
+    The registry is asked first. When it cannot answer (unreachable, timed out, refusing, or
+    sending nonsense) the snapshot in the application's repo is used, if there is one.
+    """
     what = f"{group}/{artifact}@{version}"
     base = f"{artifact}/versions/{version}"
+    key = (group, artifact, int(version))
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        content = pool.submit(_get, group, f"{base}/content", what)
-        references = pool.submit(
-            _get, group, f"{base}/references", f"references of {what}"
+    global _warned
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            content = pool.submit(_get, group, f"{base}/content", what)
+            references = pool.submit(
+                _get, group, f"{base}/references", f"references of {what}"
+            )
+
+            fetched = (
+                _json(content.result(), what),
+                _json(references.result(), f"references of {what}"),
+            )
+    except RegistryError as e:
+        snapshot = _read_snapshot(*key)
+
+        if snapshot is None:
+            path = snapshot_path(*key)
+
+            raise RegistryError(
+                f"{e}; no snapshot of {what}"
+                + (f" at {path}" if path else " (no snapshot folder is configured)")
+            ) from e
+
+        # one warning for the process; the rest of the versions are logged quietly
+        log.log(
+            logging.DEBUG if _warned else logging.WARNING,
+            "Schema registry unavailable (%s); using the snapshot of %s",
+            e,
+            what,
         )
+        _warned = True
+        SOURCES[key] = "snapshot"
+        _references[key] = snapshot[1]
 
-        return content.result().json(), references.result().json()
+        return snapshot
+
+    SOURCES[key] = "registry"
+    _references[key] = fetched[1]
+    _write_snapshot(*key, *fetched)
+
+    return fetched
+
+
+def source_of(group: str, artifact: str, version: int) -> str:
+    """ "snapshot" if this version, or any version it references, was read from a snapshot.
+
+    Only versions already loaded count; this never asks the registry.
+    """
+    key = (group, artifact, int(version))
+    sources = {SOURCES.get(key, "registry")} | {
+        source_of(r["groupId"], r["artifactId"], int(r["version"]))
+        for r in _references.get(key, [])
+    }
+
+    return "snapshot" if "snapshot" in sources else "registry"
 
 
 def _resolved(
